@@ -84,6 +84,120 @@ const PROTECT_SCRIPT: &str = r#"(function(){
   }, true);
 })();"#;
 
+/// 插件在压缩包内的保留前缀（与 packer::PLUGIN_PREFIX 一致）。
+const PLUGIN_PREFIX: &str = "__exeify_plugins__/";
+
+/// 把资源表里的插件条目摘出来（并从静态资源中移除，避免被 http 直接访问）。
+fn take_plugins(assets: &mut HashMap<String, Vec<u8>>) -> Vec<(String, String)> {
+    let keys: Vec<String> = assets
+        .keys()
+        .filter(|k| k.starts_with(PLUGIN_PREFIX))
+        .cloned()
+        .collect();
+    let mut out = Vec::new();
+    for k in keys {
+        if let Some(bytes) = assets.remove(&k) {
+            let name = k[PLUGIN_PREFIX.len()..].to_string();
+            out.push((name, String::from_utf8_lossy(&bytes).to_string()));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// 解析 UserScript 头部的 `@match` / `@include` 规则（只看前 80 行，遇到结束标记即停）。
+fn parse_match_rules(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in code.lines().take(80) {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("// @match") {
+            let p = rest.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix("// @include") {
+            let p = rest.trim();
+            // 排除“匹配所有站点”的写法，插件加载器只做定向注入。
+            if !p.is_empty() && p != "*" && !p.starts_with("*://*/*") {
+                out.push(p.to_string());
+            }
+        } else if t.starts_with("// ==/UserScript==") {
+            break;
+        }
+    }
+    out
+}
+
+/// 把 `@match` 通配写法转成正则字符串，供 JS 侧 new RegExp 测试 location.href。
+fn match_to_regex(p: &str) -> String {
+    let mut s = String::from("^");
+    for ch in p.chars() {
+        match ch {
+            '*' => s.push_str(".*"),
+            c if "\\.+?()[]{}^$|".contains(c) => {
+                s.push('\\');
+                s.push(c);
+            }
+            c => s.push(c),
+        }
+    }
+    s.push('$');
+    s
+}
+
+/// 转义成 JS 双引号字符串字面量。
+fn js_str(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => {}
+            _ => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// 生成注入脚本：页面加载时按 @match 判断当前网址，命中才执行对应插件。
+/// 直接内联源码（不走 eval），避免目标站点的 CSP 拦截 unsafe-eval。
+/// 等 DOMContentLoaded 再执行，贴近 UserScript 的 document-idle 语义。
+fn build_plugin_script(plugins: &[(String, String)]) -> Option<String> {
+    let mut blocks = String::new();
+    let mut n = 0usize;
+    for (name, code) in plugins {
+        let rules = parse_match_rules(code);
+        if rules.is_empty() {
+            continue;
+        }
+        let mut cond = String::new();
+        for r in &rules {
+            cond.push_str("try{if(new RegExp(");
+            cond.push_str(&js_str(&match_to_regex(r)));
+            cond.push_str(").test(H))OK=true}catch(e){}");
+        }
+        blocks.push_str("\n    /* ==== ");
+        blocks.push_str(name);
+        blocks.push_str(" ==== */\n    OK=false;");
+        blocks.push_str(&cond);
+        blocks.push_str("\n    if(OK){\n");
+        blocks.push_str(code);
+        blocks.push_str("\n    }\n");
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let mut s = String::new();
+    s.push_str("(function(){if(window.__exeify_plugins__)return;window.__exeify_plugins__=1;");
+    s.push_str("var H=location.href;function RUN(){var OK=false;");
+    s.push_str(&blocks);
+    s.push_str("}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',RUN);}else{RUN();}})();");
+    Some(s)
+}
+
 /// 把 "#rrggbb" 解析为 wry 的 RGBA（不透明）。解析失败时返回 None。
 fn parse_hex_rgba(hex: &str) -> Option<(u8, u8, u8, u8)> {
     let h = hex.trim().trim_start_matches('#');
@@ -182,12 +296,18 @@ pub fn run(payload: Payload) -> Result<()> {
         protect,
     } = payload.config.clone();
 
+    // 插件注入脚本（仅本地模式且目录内存在 plugins 时才有值）。
+    let mut plugin_script: Option<String> = None;
+
     let target_url = match mode {
         Mode::Url => url.context("URL 模式缺少目标地址")?,
         Mode::Local => {
             // 若加密则先在内存中解密（绝不落盘），再解压。
             let plain = decrypt_archive(&payload.archive, &enc)?;
-            let assets = unzip_to_map(&plain)?;
+            let mut assets = unzip_to_map(&plain)?;
+            // 摘出插件（同时从静态资源中移除），生成按 @match 定向注入的脚本。
+            let plugins = take_plugins(&mut assets);
+            plugin_script = build_plugin_script(&plugins);
             let entry = if entry.is_empty() {
                 "index.html".to_string()
             } else {
@@ -239,6 +359,11 @@ pub fn run(payload: Payload) -> Result<()> {
         wv_builder = wv_builder
             .with_devtools(false)
             .with_initialization_script(PROTECT_SCRIPT);
+    }
+    // 插件：每次页面加载前注入分发器，命中 @match 的脚本才执行。
+    // 放在共同 builder 上，主窗口与"有/无启动图"两条路径都覆盖。
+    if let Some(ps) = plugin_script.as_ref() {
+        wv_builder = wv_builder.with_initialization_script(ps);
     }
 
     let has_splash = splash.is_some();
@@ -305,6 +430,8 @@ pub fn run(payload: Payload) -> Result<()> {
     let child_proxy = event_loop.create_proxy();
     // 子窗口图标复用主窗口图标配置（clone 一份 move 进闭包，避免与主窗口构建争用所有权）。
     let icon_cfg_for_children = window_icon_cfg.clone();
+    // 插件脚本同样要带进闭包，注入外链子窗口（否则外链页拿不到插件）。
+    let plugin_for_children = plugin_script.clone();
     // 子窗口默认沿用应用标题与主窗口宽高。
     let child_title = window.title.clone();
     let child_w = window.width;
@@ -350,8 +477,11 @@ pub fn run(payload: Payload) -> Result<()> {
                 {
                     // 子窗口处理器保持现状：一律开应用内新窗口，不做 blob/data 下载区分。
                     // 子窗口内触发下载是罕见边缘场景，本次不覆盖（真要下载可用 <a download>）。
-                    let built = WebViewBuilder::new()
-                        .with_url(&url)
+                    let mut cb = WebViewBuilder::new().with_url(&url);
+                    if let Some(ps) = plugin_for_children.as_ref() {
+                        cb = cb.with_initialization_script(ps);
+                    }
+                    let built = cb
                         .with_new_window_req_handler(move |u, _f| {
                             let _ = cp.send_event(UserEvent::OpenWindow(u));
                             NewWindowResponse::Deny

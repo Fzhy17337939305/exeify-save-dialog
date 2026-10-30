@@ -30,6 +30,11 @@ pub fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
         if rel.is_empty() {
             continue;
         }
+        // 插件目录单独收集（见 collect_plugins），不进普通网页资源，
+        // 避免脚本被当成静态文件通过本地 http 直接访问到。
+        if rel == "plugins" || rel.starts_with("plugins/") {
+            continue;
+        }
         if entry.is_dir() {
             zip.add_directory(format!("{rel}/"), opts)
                 .context("写入目录项失败")?;
@@ -41,11 +46,77 @@ pub fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
             count += 1;
         }
     }
+    // 收集插件并写入保留前缀目录；运行时由 runner 摘出、按 @match 注入页面。
+    for (name, data) in collect_plugins(dir) {
+        zip.start_file(format!("{PLUGIN_PREFIX}{name}"), opts)
+            .context("创建插件条目失败")?;
+        zip.write_all(&data).context("写入插件失败")?;
+        count += 1;
+    }
     if count == 0 {
         bail!("目录里没有任何文件");
     }
     let cursor = zip.finish().context("完成 zip 失败")?;
     Ok(cursor.into_inner())
+}
+
+/// 插件（UserScript）在压缩包内的保留前缀。
+/// 运行时据此把它们从静态资源中摘出来、改为按 `@match` 注入页面，避免被当成普通网页文件访问。
+pub const PLUGIN_PREFIX: &str = "__exeify_plugins__/";
+
+/// 判断是否为待加载的脚本文件。
+/// 兼容两种常见形态：`.user.js` 与知识库里下载的 `.user.js.txt`（内容相同，只是后缀多了 .txt）。
+/// 真正的判定交给运行时解析 `// @match`，没有匹配规则的文件会被忽略，因此这里放宽后缀是安全的。
+fn is_plugin_file(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".js") || n.ends_with(".txt")
+}
+
+/// 扫描目录下的插件：
+/// 1) `<dir>/plugins/` 内的所有脚本（允许子目录，保留相对路径）；
+/// 2) 兼容直接把 `*.user.js` 放在网页目录根下。
+fn collect_plugins(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let pdir = dir.join("plugins");
+    if pdir.is_dir() {
+        let mut stack = vec![pdir.clone()];
+        while let Some(p) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&p) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(rel) = path.strip_prefix(&pdir) {
+                    let name = rel.to_string_lossy().replace('\\', "/");
+                    if is_plugin_file(&name) {
+                        if let Ok(data) = std::fs::read(&path) {
+                            out.push((name, data));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 根目录下直接放的 *.user.js
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.to_ascii_lowercase().ends_with(".user.js") {
+                    if let Ok(data) = std::fs::read(&path) {
+                        out.push((name.to_string(), data));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// 扫描目录识别可用的网页入口（.html/.htm），返回相对路径列表。
